@@ -1,0 +1,852 @@
+---
+title: "Pump it Up: Data Mining the Water Table - DrivenData"
+author: "David Currie"
+date: "December 28th, 2016"
+output: html_document
+---
+
+This is the code for my best submission in the "Pump it Up: Data Mining the Water Table" cometition, hosted by DrivenData. This competition really interested me because DrivenData hosts competitions for non-profits. Having the ability to help out an organization in need, especially when the goal is determining if wells are functioning in Tanzania, is a very gratifying knowning that I might provide some assistance. 
+
+The sections of the analyis are:
+-Inspecting the data
+-Clean the data
+-Feature Engineering
+-Building the model
+-Summary
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, packages}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+
+#load the necessary packages
+library(ggplot2)
+library(caret)
+library(lubridate)
+library(e1071)
+library(ranger)
+
+```
+
+```{r Helper Functions}
+
+#histogram for a feature with the 'feature_name' on the x-axis
+histo <- function(feature, feature_name, data) {
+  ggplot(aes(feature), data = data) +
+    geom_histogram() +
+    xlab(feature_name)
+}
+
+#bar graph of a feature with the 'feature_name' on the x-axis
+bar <- function(feature, feature_name, data) {
+  ggplot(aes(feature), data = data) +
+    geom_bar() +
+    xlab(feature_name)
+}
+
+#the values of a feature are ranked in decreasing frequency. 'Number' is the number of values to show.
+topN <- function(feature, number) {
+  head(sort(table(feature), decreasing = TRUE), number)
+}
+
+#the values of a feature are ranked in increasing frequency. 'Number' is the number of values to show.
+bottomN <- function(feature, number) {
+  tail(sort(table(feature), decreasing = TRUE), number)
+}
+
+#A box plot of a categorical feature with the feature's value scattered over the plot.
+boxScatter <- function(feature, featureName, data) {
+  ggplot(aes(status, feature), data = training) +
+  geom_boxplot(color = "red") +
+  geom_jitter(color = "blue", alpha = 0.0058825) +
+  scale_y_log10() +
+  ylab("log10(amount_tsh + 1)")
+}
+
+#creates a unique id for each unique value in a feature.
+createUniqueID <- function(feature) {
+  return(as.numeric(factor(feature)))
+}
+
+```
+
+
+```{r load data}
+trainingValues <- read.csv("/Users/Dave/Desktop/Programming/Personal Projects/WaterPumps-DrivenData/trainingValues.csv", stringsAsFactors=FALSE)
+trainingLabels <- read.csv("/Users/Dave/Desktop/Programming/Personal Projects/WaterPumps-DrivenData/trainingLabels.csv", stringsAsFactors=FALSE)
+testing <- read.csv("/Users/Dave/Desktop/Programming/Personal Projects/WaterPumps-DrivenData/testingValues.csv", stringsAsFactors=FALSE)
+testingID <- read.csv("/Users/Dave/Desktop/Programming/Personal Projects/WaterPumps-DrivenData/testingValues.csv", stringsAsFactors=FALSE)
+```
+
+# Inspecting the Data
+
+Let's start with a look at how much data we have.
+
+```{r}
+dim(trainingValues)
+```
+
+So we have a fair amount of data here, 40 features with 59,400 rows of data. Now for a closer look at the data.
+
+```{r}
+str(trainingValues)
+```
+
+The top 10 rows of the data:
+
+```{r}
+head(trainingValues, 10)
+```
+
+Hmm, we have some missing data here, such as in "scheme_name" and "scheme_management." Let's take a look at the amount of missing data in each feature.
+
+# Cleaning the Data
+
+```{r bind trianing and testing}
+#Join the training and testing sets.
+df <- rbind(trainingValues, testing)
+```
+
+
+```{r}
+#find any null values
+sort(colSums(sapply(df, is.na)),decreasing = TRUE)
+```
+
+Okay...we don't have any null values, but we know there are some missing values. We'll have to look at the features one-by-one to find what's not quite right.
+
+First, let's see what the status of the water pumps are, since that's our main feature.
+```{r}
+ggplot(aes(status_group), data = trainingLabels) +
+  geom_bar()
+table(trainingLabels$status_group)
+```
+
+It's good to see that most of the wells are functioning, but the data is very unequally distributed. 
+
+Next, what are the top 20 subvillages.
+
+```{r}
+topN(df$subvillage, 20)
+```
+
+Hmm, looks like we have some interesting values here, including capital letters, empty strings, and 1. There are a few things we could do to try to correct these values, such as assign them the nearest subvillages based on latitude or longitude, however these features and many others are also missing values, so I am going to assign the value of 'None' to all of the subvillages.
+
+```{r fix subvillage}
+#inaccurate values we will replace with 'None'
+subvillageNames <- c("A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q",
+                     "R","S","T","U","V","W","X","Y","Z","","1")
+
+df$subvillage[df$subvillage %in% subvillageNames] <- "None"
+print("Number of subvillages with the value 'None'")
+table(df$subvillage == "None")
+```
+
+```{r}
+#Checking the subvillages after assigning corrected values.
+#sort(table(df$region), decreasing = TRUE)
+```
+
+Below are the region codes, but I am going to remove this feature because we will use dummy variables to represent the regions. You might be thinking, why not keep this feature and remove the regions' names to save a step. To help to ensure that the data is correct and make feature engineering easier, I think that it is best to keep the regions' names instead.
+
+```{r}
+table(df$region_code)
+#we're going to make dummy variables out of the region feature, so there is no need for this.
+df <- subset(df, select = -c(region_code))
+```
+
+Below we have the district codes. There are 21 districts and 20 regions. I'm not sure how accurate the district codes are or how they work because when I try to find the average district code for subvillages, lgas, wards, or regions, there are never still 21 districts. I'm going to drop this feature because of its unreliability and there should be enough geographic features already.
+
+```{r}
+print("The district codes:")
+table(df$district_code)
+df <- subset(df, select = -c(district_code))
+
+#length(unique(df$district_code))
+#length(unique(df$region))
+#a <- round(tapply(df$district_code, df$ward, mean))
+#length(unique(a))
+```
+
+Below we have the 20 most frequent wards, everything looks good here.
+
+```{r}
+topN(df$ward, 20)
+```
+
+
+
+```{r}
+histo(df$amount_tsh, "amount_tsh", df)
+summary(df$amount_tsh)
+table(df$amount_tsh)
+```
+
+We have some very skewed data here. Let's tranform amount_tsh by log10 to help make this plot a little clearer.
+
+```{r}
+ggplot(aes(amount_tsh + 1), data = df) +
+  geom_histogram() +
+  scale_x_log10() +
+  xlab("log10(amount_tsh + 1)")
+```
+
+That's much better. Now we can see the range of values better. I am going to create a new feature for this tranformation of amount_tsh.
+
+
+```{r}
+df$log_amount_tsh <- log10(df$amount_tsh + 1)
+summary(df$log_amount_tsh)
+```
+
+
+```{r}
+ggplot(aes(date_recorded), data = df) +
+  geom_histogram(stat="count")
+#table(df$date_recorded)
+```
+
+The dates are impossible to read, but they vary from 2002-10-14 to 2013-12-03, so we have quite the range here.
+
+
+```{r}
+head(sort(table(df$funder), decreasing = TRUE), 20)
+```
+
+Here we have the 20 most common funders, except the second key is missing and another is "0". I'm going to set these to Unknown because I don't think there will be an easy way to find their true values.
+
+```{r}
+df$funder[df$funder == "0"] <- "Unknown"
+df$funder[df$funder == ""] <- "Unknown"
+#head(sort(table(df$funder), decreasing = TRUE), 20) #All good now
+```
+
+```{r}
+histo(df$gps_height, "gps_height", df)
+#table(df$gps_height == 0)
+```
+
+0 is a very common value for gps_height. I expect that this means we have many missing values. I am going to take an average of the subvillage values, where gps_height does not equal 0, and assign these values to the subvillages where the gps_height does equal 0.
+
+```{r}
+#we don't want to use the missing values when taking the average.
+a <- subset(df, gps_height != 0)
+df$gps_height[df$gps_height == 0] <- tapply(a$gps_height, a$subvillage, mean)
+histo(df$gps_height, "gps_height with new values", df)
+summary(df$gps_height)
+```
+
+That looks better. A few subvillages have gps_heights very close to 0 or even below, but this is possible because some locations can be below sea level.
+
+
+```{r}
+topN(df$installer, 20)
+```
+
+Much like with funder, the installer feature has keys with values of 0 and nothing. Let's also change these to "Unknown".
+
+```{r}
+df$installer[df$installer == "-"] <- "Unknown"
+df$installer[df$installer == "0"] <- "Unknown"
+```
+
+```{r}
+head(sort(table(df$longitude), decreasing = TRUE), 20)
+```
+
+Quite a few values are set to 0 here. Just like with gps_height, I am going to find, then apply, the non-zero average of the subvillages, which will hence forth be referred to as the 'non-zero average function.'
+
+```{r fix longitude}
+a <- subset(df, longitude != 0)
+df$longitude[df$longitude == 0] <- tapply(a$longitude, a$subvillage, mean)
+print("Summary of longitude")
+summary(df$longitude)
+#table(df$longitude == 0)
+```
+
+As expected, latitude has the same problem as longitude and the non-zero average function will be applied here.
+
+```{r}
+head(sort(table(df$latitude), decreasing = TRUE), 20)
+```
+
+
+```{r fix latitude}
+a <- subset(df, latitude != -0.00000002)
+df$latitude[df$latitude == -0.00000002] <- tapply(a$latitude, 
+                                                  a$subvillage, 
+                                                  mean)
+
+print("Summary of latitude")
+summary(df$latitude)
+#head(sort(table(df$latitude), decreasing = TRUE), 20)
+#table(df$latitude == -0.00000002)
+```
+
+
+
+```{r}
+histo(df$num_private, "num_private", df)
+table(df$num_private)
+```
+
+I am not sure what num_private is, but most of the values are 0 and there are a few extreme outliers. I'm going to keep this feature as it should still be be useful in the feature engineering stage.
+
+```{r}
+topN(df$basin, 20)
+```
+
+Everything looks good with the values of basin.
+
+```{r}
+histo(df$population, "population", df)
+```
+
+Looks like we have some big outliers and many of the values are very close to 0. Let's take a closer look.
+
+```{r}
+summary(df$population)
+print("Number of values that are <= 1:")
+table(df$population <= 1)
+```
+
+Many of the values are <= 1. I don't believe this is the case, so we are going to use the non-zero average function, but using 1 instead of 0.
+
+```{r}
+a <- subset(df, population > 1)
+df$population[df$population <= 1] <- tapply(a$population, a$subvillage, mean)
+
+histo(df$population, "population with new values", df)
+
+ggplot(aes(population), data = df) +
+  geom_histogram() +
+  scale_y_log10() +
+  xlab("log10(population with new values)")
+
+```
+
+
+
+```{r}
+print("public_meeting values")
+table(df$public_meeting)
+```
+
+Since the number of True values outnumber False 10:1, I'm going to assign all of the empty strings to True.
+
+```{r}
+df$public_meeting[df$public_meeting == ""] <- "True"
+```
+
+```{r}
+print("recorded_by values:")
+table(df$recorded_by)
+```
+
+Since it's always the same values, I'm going to drop this feature.
+```{r}
+df <- subset(df, select = -c(recorded_by))
+```
+
+```{r}
+print("scheme_management values")
+table(df$scheme_management)
+```
+
+Let's set all of the empty strings to None.
+
+```{r}
+df$scheme_management[df$scheme_management == ""] <- "None"
+```
+
+```{r}
+print("Top 20 most frequent scheme_name values")
+topN(df$scheme_name,20)
+```
+
+Looks like we have the same problem as with subvillage values. We'll set all of these unlikely values to None.
+
+```{r}
+badSchemeNames <- c("A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q",
+                     "R","S","T","U","V","W","X","Y","Z","","1")
+df$scheme_name[df$scheme_name %in% badSchemeNames] <- "None"
+```
+
+
+```{r}
+print("permit values")
+table(df$permit)
+```
+
+I'm going to change the value of True to 1 and False to 0, then find the average value for each subvillage (very similar to the non-zero average function). I will then apply these values to the empty strings.
+
+```{r}
+df$permit[df$permit == "True"] <- 1 
+df$permit[df$permit == "False"] <- 0
+df$permit[df$permit == ""] <- 2
+df$permit <- as.numeric(df$permit) #change strings to numericals
+
+a <- subset(df, permit != 2)
+
+df$permit[df$permit == 2] <- round(tapply(a$permit, a$subvillage, mean))
+table(df$permit)
+```
+
+```{r}
+histo(df$construction_year, "construction_year", df)
+ggplot(aes(construction_year), data = subset(df, construction_year > 0)) +
+  geom_histogram()
+```
+
+Some very obvious incorrect values here. I'm going to assume that there is a strong correlation between proximity to another well and year built, i.e. wells in the same subvillage have the same (or very similar) construction year. Therefore, we are going to assign the missing values  the average construction year in the same subvillage.
+
+
+```{r fix construction_year}
+a <- subset(df, construction_year > 0)
+df$construction_year[df$construction_year == 0] <- tapply(a$construction_year,
+                                                         a$subvillage,
+                                                         mean)
+
+histo(df$construction_year, "construction_year with new values", df)
+```
+
+All of the tables below have values that look reasonable.
+
+```{r}
+print("extraction_type")
+table(df$extraction_type)
+
+print("extraction_type_group")
+table(df$extraction_type_group)
+
+print("extraction_type_class")
+table(df$extraction_type_class)
+
+print("management")
+table(df$management)
+
+print("management_group")
+table(df$management_group)
+
+print("payment")
+table(df$payment)
+
+print("payment_type")
+table(df$payment_type)
+
+print("water_quality")
+table(df$water_quality)
+
+print("quality_group")
+table(df$quality_group)
+
+print("quantity")
+table(df$quantity)
+
+print("quantity_group")
+table(df$quantity_group)
+
+print("Quantity group is the same as quantity, so we're going to drop it.")
+
+df <- subset(df, select = -c(quantity_group))
+
+print("source")
+table(df$source)
+
+print("source_type")
+table(df$source_type)
+
+print("source_class")
+table(df$source_class)
+
+print("waterpoint_type")
+table(df$waterpoint_type)
+
+print("waterpoint_type_group")
+table(df$waterpoint_type_group)
+```
+
+Alright, the features have all been cleaned, now we can seperate the train and test sets to see how the features compare to the status of the wells.
+
+```{r}
+training <- df[0:nrow(trainingValues),]
+testing <- df[(nrow(trainingValues) + 1): nrow(df),]
+training$status <- trainingLabels$status_group
+```
+
+```{r}
+ggplot(aes(status, amount_tsh), data = training) +
+  geom_boxplot()
+```
+
+We have some outliers, let's take a closer look by transforming amount_tsh by log10.
+
+```{r}
+ggplot(aes(status, amount_tsh + 1), data = training) +
+  geom_violin(color = "red") +
+  geom_jitter(color = "blue", alpha = 0.0058825) +
+  scale_y_log10() +
+  ylab("log10(amount_tsh + 1)")
+by(training$amount_tsh, training$status, summary)
+```
+
+We can see that there is typically more water at functioning wells, than nonfunctional. There are also quite a few extreme outliers for functional wells.
+
+```{r}
+ggplot(aes(status, gps_height), data = training) +
+  geom_violin(color = "red", draw_quantiles = c(0.25,0.5,0.75)) +
+  geom_jitter(color = "blue", alpha = 0.0055)
+by(training$gps_height, training$status, summary)
+```
+
+(Note: The three horizontal lines per graph represent the 75th, 50th, and 25th quantiles.)
+The values looks to be rather evenly distributed, even in terms of outliers.
+
+```{r}
+ggplot(aes(status, num_private + 1), data = training) +
+  geom_violin(alpha = 0.1) +
+  geom_jitter(color = "blue", alpha = 0.0055) +
+  scale_y_log10() +
+  ylab("log10(num_private + 1)")
+by(training$num_private, training$status, summary)
+table(training$num_private == 0)
+```
+
+Most of the values are 0 (58643 out of 59400), so it's not too surprising to see the violin plots we have here.
+
+```{r}
+ggplot(aes(status, population + 1), data = training) +
+  geom_violin(color = "red", draw_quantiles = c(0.25,0.5,0.75)) +
+  geom_jitter(color = "blue", alpha = 0.0055) +
+  scale_y_log10() +
+  ylab("log10(population + 1)")
+by(training$population, training$status, summary)
+```
+
+The distributions look very similar here as well. The main differences that I see are the outliers in the functional wells and the higher number of 0 values in the non functional wells.
+
+
+```{r}
+table(training$construction_year < 1)
+ggplot(aes(status, construction_year), data = training) +
+  geom_violin(color = "red", draw_quantiles = c(0.25,0.5,0.75)) +
+  geom_jitter(color = "blue", alpha = 0.0055)
+by(training$construction_year, training$status, summary)
+```
+
+It looks pretty clear that newer wells are more likely to be functional than older wells and that many wells were built during 2007/2008.
+
+```{r}
+ggplot(aes(status, longitude), data = training) +
+  geom_violin(color = "red", draw_quantiles = c(0.25,0.5,0.75)) +
+  geom_jitter(color = "blue", alpha = 0.0055)
+by(training$longitude, training$status, summary)
+```
+
+Functional wells look to have a more central longitude. Extreme longitudes seem to be more common with wells that need repair or are non functional.
+
+```{r}
+ggplot(aes(status, latitude), data = training) +
+  geom_violin(color = "red", draw_quantiles = c(0.25,0.5,0.75)) +
+  geom_jitter(color = "blue", alpha = 0.0055)
+by(training$latitude, training$status, summary)
+```
+
+The main thing I see here is that there are disproportionately more well just below -3 and -9 degrees latitude.
+
+# Feature Engineering
+
+Let's rejoin the training and testing test to do some feature engineering (unfortunately this can only be seen if you look at my .RMD file).
+
+ 
+```{r}
+training <- subset(training, select = -c(status))
+df <- rbind(training, testing)
+```
+
+
+```{r feature engineering}
+#if the well has water or not
+df$hasWater <- 0
+df$hasWater[df$amount_tsh > 0] <- 1
+
+#well are ranked by the amount of water
+df$waterQuantiles <- 0
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.2)] <- 1
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.4)] <- 2
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.6)] <- 3
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.8)] <- 4
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.9)] <- 5
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.95)] <- 6
+df$waterQuantiles[df$amount_tsh > quantile(df$amount_tsh, 0.99)] <- 7
+
+#Get the year, month, weekday, and year-month-combo of the date recorded
+df$year_recorded <- year(df$date_recorded)
+df$month_recorded <- month(df$date_recorded)
+df$weekday_recorded <- wday(df$date_recorded)
+df$year_month_recorded <- df$year_recorded + df$month_recorded / 12
+
+#subtract year (and month) by earliest year (and month) for easier comparison.
+df$simple_year_recorded <- df$year_recorded - 2001
+df$simple_year_month_recorded <- df$simple_year_recorded + df$month_recorded / 12
+
+#create a unique id for each funder
+df$funder_id <- createUniqueID(df$funder)
+
+#sort gps height into 5 equal groups based on increasing values
+df$gps_height_quantiles <- 0
+df$gps_height_quantiles[df$gps_height > quantile(df$gps_height, 0.2)] <- 1
+df$gps_height_quantiles[df$gps_height > quantile(df$gps_height, 0.4)] <- 2
+df$gps_height_quantiles[df$gps_height > quantile(df$gps_height, 0.6)] <- 3
+df$gps_height_quantiles[df$gps_height > quantile(df$gps_height, 0.8)] <- 4
+
+#create a unique id for each installer
+df$installer_id <- createUniqueID(df$installer)
+
+#round longitude and latitude 
+df$roundedLongitude <- floor(df$longitude)
+df$roundedLatitude <- floor(df$latitude)
+
+#Set the minimum values to 0 for easier comparison.
+df$simpleLongtitude <- floor(df$longitude) - min(floor(df$longitude))
+df$simpleLatitude <- floor(df$latitude) - min(floor(df$latitude)) 
+
+#new feature to determine if num_private is greater than 0 
+df$hasNumPrivate <- 0
+df$hasNumPrivate[df$num_private > 0] <- 1
+
+#If the subvillage is not None, set value to 1
+df$knownSubvillage <- 0
+df$knownSubvillage[df$subvillage != "None"] <- 1
+
+#Create a unique id for each unique subvillage
+df$subvillageID <- createUniqueID(df$subvillage)
+
+#Group subvillages by their frequency.
+df$commonSubvillage <- 0 #<10
+df$commonSubvillage[df$subvillage %in% names(topN(df$subvillage, 1058))] <- 1 #10-99
+df$commonSubvillage[df$subvillage %in% names(topN(df$subvillage, 34))] <- 2 #>= 100
+df$commonSubvillage[df$subvillage %in% names(topN(df$subvillage, 1))] <- 3 #most common
+
+#There are 21 regions, group them by frequency into 4 groups.
+df$regionSize <- 0
+df$regionSize[df$region %in% names(topN(df$region, 16))] <- 1
+df$regionSize[df$region %in% names(topN(df$region, 11))] <- 2
+df$regionSize[df$region %in% names(topN(df$region, 6))] <- 3
+
+#There are 125 lgas, group them by frequency into 5 equal groups.
+df$lgaSize <- 0
+df$lgaSize[df$lga %in% names(topN(df$lga, 100))] <- 1
+df$lgaSize[df$lga %in% names(topN(df$lga, 75))] <- 2
+df$lgaSize[df$lga %in% names(topN(df$lga, 50))] <- 3
+df$lgaSize[df$lga %in% names(topN(df$lga, 25))] <- 4
+
+#Create a unique id for each unique lga
+df$lgaID <- createUniqueID(df$lga)
+
+#There are 2098 wards, group them by frequency. If >100 = 2, if in the 50th percentile = 1, else 0.
+df$wardSize <- 0
+df$wardSize[df$ward %in% names(topN(df$ward, 1049))] <- 1
+df$wardSize[df$ward %in% names(topN(df$ward, 101))] <- 2
+
+#Create a unique id for each unique ward
+df$wardID <- createUniqueID(df$ward)
+
+#Group populations by their sizes.
+df$population_quantiles <- 0
+df$population_quantiles[df$population > quantile(df$population, 0.2)] <- 1
+df$population_quantiles[df$population > quantile(df$population, 0.4)] <- 2
+df$population_quantiles[df$population > quantile(df$population, 0.6)] <- 3
+df$population_quantiles[df$population > quantile(df$population, 0.8)] <- 4
+df$population_quantiles[df$population > quantile(df$population, 0.9)] <- 5
+df$population_quantiles[df$population > quantile(df$population, 0.95)] <- 6
+df$population_quantiles[df$population > quantile(df$population, 0.99)] <- 7
+df$population_quantiles[df$population > quantile(df$population, 0.999)] <- 8
+
+#group funder by their frequency.
+df$funderSize <- 0 #<10
+df$funderSize[df$funder %in% names(topN(df$funder, 450))] <- 1 #10-99 
+df$funderSize[df$funder %in% names(topN(df$funder, 101))] <- 2 #100-999
+df$funderSize[df$funder %in% names(topN(df$funder, 14))] <- 3 #>=1000
+
+#group installer by how their frequency.
+df$installerSize <- 0 #<10
+df$installerSize[df$installer %in% names(topN(df$installer, 476))] <- 1 #10-99
+df$installerSize[df$installer %in% names(topN(df$installer, 105))] <- 2 #100-999
+df$installerSize[df$installer %in% names(topN(df$installer, 8))] <- 3 #>=1000
+
+#Create an unique id for each unique wpt_name
+df$wpt_name_id <- createUniqueID(df$wpt_name)
+
+#group wpt_name by how their frequency.
+df$wpt_nameSize <- 0 #=1
+df$wpt_nameSize[df$wpt_name %in% names(topN(df$wpt_name, 5802))] <- 1 #2-9
+df$wpt_nameSize[df$wpt_name %in% names(topN(df$wpt_name, 341))] <- 2 #10-99
+df$wpt_nameSize[df$wpt_name %in% names(topN(df$wpt_name, 22))] <- 3 #>=100
+
+#If scheme_management is not None or Other, set it to 1
+df$knownSchemeManagement <- 0
+schemeManagementNames <- c("Company","Parastatal","Private operator","SWC","Trust","VWC",
+                           "Water authority","Water Board","WUA","WUG")
+df$knownSchemeManagement[df$scheme_management %in% schemeManagementNames] <- 1
+
+#If scheme name is not None, set it to 1
+df$knownSchemeName <- 0
+df$knownSchemeName[df$scheme_name != "None"] <- 1
+
+#Create a unique id for each unique scheme name
+df$schemeNameID <- createUniqueID(df$scheme_name)
+
+#group scheme name by how common it is.
+df$commonSchemeName <- 0 #=1
+df$commonSchemeName[df$scheme_name %in% names(topN(df$scheme_name, 2097))] <- 1 #2-9
+df$commonSchemeName[df$scheme_name %in% names(topN(df$scheme_name, 929))] <- 2 #10-99
+df$commonSchemeName[df$scheme_name %in% names(topN(df$scheme_name, 35))] <- 3 #>100
+df$commonSchemeName[df$scheme_name %in% names(topN(df$scheme_name, 1))] <- 4 #most common
+
+#Number of years since construction began.
+df$simpleConstructionYear <- df$construction_year - 1960
+
+#Group construction year by decade
+df$constructionDecade <- 0
+df$constructionDecade[df$construction_year > 1970] <- 1
+df$constructionDecade[df$construction_year > 1980] <- 2
+df$constructionDecade[df$construction_year > 1990] <- 3
+df$constructionDecade[df$construction_year > 2000] <- 4
+df$constructionDecade[df$construction_year > 2010] <- 5
+```
+
+```{r}
+#Remove these features because they have too many different values, it crashes R when I try to create dummy variables.
+df2 <- subset(df, select = -c(date_recorded, subvillage, funder, installer,wpt_name,lga,
+                              ward,scheme_name))
+```
+
+
+```{r dummy variables}
+#select features by their class
+feature_classes <- sapply(names(df2),function(x){class(df2[[x]])})
+#select features with the class 'character'.
+categorical_features <- names(feature_classes[feature_classes == "character"])
+#create dummy variables
+dummies <- dummyVars(~.,df2[categorical_features])
+dummy_features <- predict(dummies,df2[categorical_features])
+#if dummy variable = na, set it to 0
+dummy_features[is.na(dummy_features)] <- 0
+#select features that do not have the class 'character'.
+numeric_features <-names(feature_classes[feature_classes != "character"])
+#combine all of the features.
+dfFinal <- cbind(df2[numeric_features], dummy_features)
+dfFinal <- subset(dfFinal, select = -c(id))
+```
+
+# Build the Model
+
+```{r}
+#reseperate the training and testing data
+training <- dfFinal[0:nrow(training),]
+testing <- dfFinal[(nrow(training) + 1): nrow(dfFinal),]
+
+training$status <- trainingLabels$status_group
+training$status <- as.factor(training$status)
+#head(training$status, 20)
+```
+
+```{r}
+#remove the features that have have zero variance.
+badFeatures <- nearZeroVar(training)
+training <- training[,-badFeatures]
+
+#separate the training data into a training and testing set.
+firstPartition <- createDataPartition(training$status, p=0.8, list = FALSE)
+finalTraining <- training[firstPartition,]
+validation <- training[-firstPartition,]
+
+#separate the testing data into a first and final testing set.
+finalPartition <- createDataPartition(validation$status, p=0.67, list = FALSE)
+firstValidation <- validation[finalPartition,]
+finalValidation <- validation[-finalPartition,]
+```
+
+To run the model properly, use cross validation and 10 folds, but to knit the file quickly to HTML, I changed these values.
+
+
+```{r}
+set.seed(1)
+rangerModel <- train(status ~ ., data = finalTraining, 
+                     method = "ranger", 
+                     metric = "Accuracy",
+                     preProcess = c("zv", "center", "scale"), 
+                     trControl = trainControl(number = 1, 
+                                              verbose = TRUE
+                                              #method = "cv"
+                                              ),
+                     tuneGrid=data.frame(.mtry = c(15))) #best score: 0.8144
+
+#I tried using up sampling to counter the imbalanced classes, but that did not improve my submission score.
+```
+
+
+
+```{r}
+#Use these plots and summary to better compare multiple models.
+
+# collect resamples
+#results <- resamples(list(model1 = rangerModel))
+# summarize the distributions
+#summary(results)
+# boxplots of results
+#bwplot(results)
+# dot plots of results
+#dotplot(results)
+```
+
+Predicting with the first validation set:
+
+```{r}
+#firstValidation is used regularly to test the quality of the model
+model1Pred <- predict(rangerModel, subset(firstValidation, select = -c(status)))
+confusionMatrix(model1Pred, firstValidation$status)
+```
+
+Predicting with the final validating set:
+
+```{r}
+#finalValidation is only used just before creating a submission to the competition. This limits the model overfitting its data.
+model2Pred <- predict(rangerModel, subset(finalValidation, select = -c(status)))
+confusionMatrix(model2Pred, finalValidation$status)
+```
+
+```{r}
+predsFinal <- predict(rangerModel, testing)
+solution <- data.frame(Id = testingID$id, status_group=predsFinal)
+write.csv(solution,"/Users/Dave/Desktop/Programming/Personal Projects/WaterPumps-DrivenData/submission.csv",row.names=FALSE)
+#head(solution, 10)
+```
+
+```{r}
+#Find the most/least important features.
+#glmModel <- glm(finalTraining)
+#order(varImp(glmModel), decreasing = TRUE)
+#colnames(finalTraining[69])
+```
+
+# Summary
+
+The goal of this model is to predict which wells are functioning, need repair, or are not working. The data was provided by DrivenData as part of their 'Pump it Up: Data Mining the Water Table' competition. I believe that my model does as rather good job of performing this task as it currently rank 65th out of 2567 users. My score (based on classification accuracy) is 0.8213, and the top score is 0.8285, so I'm not off the mark by too much. There are a few ways for how my score could be improved, including finding different values for the missing values when cleaning my data, engineering new features, using a different algorithm, using different features to train the model, and using an ensemble of models to make a prediction. After putting quite a few hours into build my model, I chose to stop fine-tuning my dataset and model because my time would be better spent working on different datasets/projects.
+
+The five most important features for my model are: log_amount_tsh, construction_year, hasWater, extraction_type_groupsubmersible, and extraction_type_groupnira/tanira. From just these features we can learn that functional wells typically have more water at the source and are built more recently.
+
+```{r}
+print("Comparing status of wells with log_amount_tsh")
+by(finalTraining$log_amount_tsh, finalTraining$status, summary)
+print("Comparing status of wells with construction_year")
+by(finalTraining$construction_year, finalTraining$status, summary)
+print("Comparing status of wells with hasWater")
+by(finalTraining$hasWater, finalTraining$status, summary)
+```
+
+
+My predictions followed a similar distribution, with respect to the status of the wells, to the training dataset, but functioning wells were overrepresented and functional-needs-repair were underrepresented. I tried upsampling to counter the unequal distrbution, but it did not improve my score. This issue expresses how machine learning competition models differ from real world models. Rather than overall accuracy being most important, it would be more useful to know which wells are not working or need repair. Catering the model to predict these types of wells correctly could decrease the overall accuracy, but would improve the usefullness of the model in the real world. 
+
+
+
